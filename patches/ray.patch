@@ -1,0 +1,299 @@
+--- rllib/algorithms/ppo/torch/ppo_torch_rl_module.py	2025-02-21 18:03:42.269141739 +0000
++++ rllib/algorithms/ppo/torch/ppo_torch_rl_module.py	2024-09-08 14:34:27.199969976 +0000
+@@ -51,7 +51,8 @@
+             output[Columns.STATE_OUT] = encoder_outs[Columns.STATE_OUT]
+ 
+         # Pi head.
+-        output[Columns.ACTION_DIST_INPUTS] = self.pi(encoder_outs[ENCODER_OUT][ACTOR])
++        pi_out = self.pi(encoder_outs[ENCODER_OUT][ACTOR])
++        output[Columns.ACTION_DIST_INPUTS] = pi_out
+ 
+         return output
+ 
+--- rllib/connectors/common/batch_individual_items.py	2025-02-21 18:03:42.275141870 +0000
++++ rllib/connectors/common/batch_individual_items.py	2024-10-06 10:05:05.076711097 +0000
+@@ -1,14 +1,14 @@
+ from typing import Any, List, Optional
+ 
+ from ray.rllib.connectors.connector_v2 import ConnectorV2
+ from ray.rllib.core import DEFAULT_MODULE_ID
+ from ray.rllib.core.columns import Columns
+ from ray.rllib.core.rl_module.marl_module import MultiAgentRLModule
+ from ray.rllib.core.rl_module.rl_module import RLModule
+ from ray.rllib.env.multi_agent_episode import MultiAgentEpisode
+ from ray.rllib.utils.annotations import override
+-from ray.rllib.utils.spaces.space_utils import batch
++from ray.rllib.utils.spaces.space_utils import batch, BatchedNdArray
+ from ray.rllib.utils.typing import EpisodeType
+ 
+ 
+ class BatchIndividualItems(ConnectorV2):
+@@ -66,15 +66,28 @@
+                         if column == Columns.OBS:
+                             memorized_map_structure.append(eps_id)
+                         list_to_be_batched.append(item)
+-                # INFOS should not be batched (remain a list).
+-                data[column] = (
+-                    list_to_be_batched
+-                    if column == Columns.INFOS
+-                    else batch(
+-                        list_to_be_batched,
++                
++                if column == Columns.INFOS:
++                    data[column] = list_to_be_batched
++                elif isinstance(column_data, list):
++                    data[column] = batch(
++                        column_data,
+                         individual_items_already_have_batch_dim="auto",
+                     )
+-                )
++                else:
++                    if list_to_be_batched and hasattr(list_to_be_batched[0], "keys"):
++                        data[column] = {
++                            k: batch(
++                                [i[k] for i in list_to_be_batched] if isinstance(list_to_be_batched[0][k], BatchedNdArray) else [[i[k]] for i in list_to_be_batched],
++                                individual_items_already_have_batch_dim="auto"
++                            )
++                            for k in list_to_be_batched[0].keys()
++                        }
++                    else:
++                        data[column] = batch(
++                            list_to_be_batched,
++                            individual_items_already_have_batch_dim="auto",
++                        )
+                 if is_marl_module:
+                     if DEFAULT_MODULE_ID not in data:
+                         data[DEFAULT_MODULE_ID] = {}
+
+--- rllib/core/learner/learner.py	2025-02-21 18:03:42.279141957 +0000
++++ rllib/core/learner/learner.py	2024-07-05 20:12:48.674849680 +0000
+@@ -1371,7 +1371,15 @@
+         self._after_gradient_based_update(timesteps)
+ 
+         # Reduce results across all minibatch update steps.
+-        return self.metrics.reduce()
++        return {
++            mid: metrics
++            for mid, metrics in self.metrics.reduce().items()
++            if ( 
++                self.should_module_be_updated(mid, batch)
++                or
++                mid == ALL_MODULES
++            )   
++        }
+ 
+     @OverrideToImplementCustomLogic_CallToSuperRecommended
+     def _after_gradient_based_update(self, timesteps: Dict[str, Any]) -> None:
+
+--- rllib/core/models/catalog.py	2025-02-21 18:03:42.281142001 +0000
++++ rllib/core/models/catalog.py	2024-07-05 17:14:54.029050536 +0000
+@@ -109,6 +109,9 @@
+         self._view_requirements = view_requirements
+         self._latent_dims = None
+ 
++        if not isinstance(self.observation_space, Box):
++            raise ValueError(self.observation_space)
++
+         self._determine_components_hook()
+ 
+     @OverrideToImplementCustomLogic_CallToSuperRecommended
+
+--- rllib/core/models/torch/encoder.py	2025-02-21 18:03:42.283142045 +0000
++++ rllib/core/models/torch/encoder.py	2024-09-01 16:47:13.154309853 +0000
+@@ -368,9 +368,18 @@
+         return SpecDict(
+             {
+                 # b, t for batch major; t, b for time major.
+-                Columns.OBS: TensorSpec(
+-                    "b, t, d", d=self.config.input_dims[0], framework="torch"
+-                ),
++                Columns.OBS: {
++                    "image": TensorSpec(
++                        "b, t, w, h, c",
++                        w=self.config.tokenizer_config.cnn_encoder_config.input_dims[0],
++                        h=self.config.tokenizer_config.cnn_encoder_config.input_dims[1],
++                        c=self.config.tokenizer_config.cnn_encoder_config.input_dims[2],
++                        framework="torch",
++                    ),
++                    "labels": TensorSpec(
++                        "b, t, d", d=self.config.tokenizer_config.mlp_encoder_config.input_dims[0], framework="torch"
++                    ),
++                },
+                 Columns.STATE_IN: self._state_in_out_spec,
+             }
+         )
+
+--- rllib/core/rl_module/torch/torch_rl_module.py	2025-02-21 18:03:42.285142088 +0000
++++ rllib/core/rl_module/torch/torch_rl_module.py	2024-06-21 20:00:18.600225079 +0000
+@@ -111,8 +111,8 @@
+     @override(RLModule)
+     def set_state(self, state_dict: Mapping[str, Any]) -> None:
+         state_dict = convert_to_torch_tensor(state_dict)
+-        self.load_state_dict(state_dict)
++        self.load_state_dict(state_dict, strict=False)
+ 
+     def _module_state_file_name(self) -> pathlib.Path:
+         return pathlib.Path("module_state.pt")
+
+--- rllib/env/env_runner_group.py	2025-02-21 18:03:42.288142154 +0000
++++ rllib/env/env_runner_group.py	2024-07-03 16:32:43.991862882 +0000
+@@ -1105,18 +1105,21 @@
+             Dict[PolicyID, Tuple[gym.spaces.Space, gym.spaces.Space]]
+         ] = None,
+     ) -> Union[EnvRunner, ActorHandle]:
+-        worker = cls(
+-            env_creator=env_creator,
+-            validate_env=validate_env,
+-            default_policy_class=self._policy_class,
+-            config=config,
+-            worker_index=worker_index,
+-            num_workers=num_workers,
+-            recreated_worker=recreated_worker,
+-            log_dir=self._logdir,
+-            spaces=spaces,
+-            dataset_shards=self._ds_shards,
+-        )
++        try:
++            worker = cls(
++                env_creator=env_creator,
++                validate_env=validate_env,
++                default_policy_class=self._policy_class,
++                config=config,
++                worker_index=worker_index,
++                num_workers=num_workers,
++                recreated_worker=recreated_worker,
++                log_dir=self._logdir,
++                spaces=spaces,
++                dataset_shards=self._ds_shards,
++            )
++        except Exception as e:
++            raise ValueError(e)
+ 
+         return worker
+ 
+
+--- rllib/env/multi_agent_episode.py	2025-02-21 18:03:42.289142176 +0000
++++ rllib/env/multi_agent_episode.py	2024-10-02 20:06:27.320107555 +0000
+@@ -2527,7 +2527,7 @@
+                             indices=index_incl_lookback - sub_buffer.lookback,
+                             neg_indices_left_of_zero=True,
+                             fill=fill,
+-                            _add_last_ts_value=hanging_val,
++                            _add_last_ts_value=(hanging_val or {}).get(key),
+                             **one_hot_discrete,
+                         )
+                         for key, sub_buffer in inf_lookback_buffer.items()
+
+--- rllib/env/single_agent_env_runner.py	2025-02-21 18:03:42.290142198 +0000
++++ rllib/env/single_agent_env_runner.py	2024-07-10 20:31:20.370347978 +0000
+@@ -448,7 +448,7 @@
+ 
+         for env_index in range(self.num_envs):
+             episodes[env_index].add_env_reset(
+-                observation=obs[env_index],
++                observation={k: o[env_index] for k, o in obs.items()} if isinstance(obs, dict) else obs[env_index],
+                 infos=infos[env_index],
+             )
+             self._make_on_episode_callback("on_episode_start", env_index, episodes)
+--- rllib/env/single_agent_env_runner.py	2025-02-21 18:03:42.290142198 +0000
++++ rllib/env/single_agent_env_runner.py	2024-07-10 20:31:20.370347978 +0000
+@@ -670,7 +670,7 @@
+             AssertionError: If the EnvRunner Actor has NOT been properly initialized.
+         """
+         # Make sure, we have built our gym.vector.Env and RLModule properly.
+-        assert self.env and self.module
++        assert self.env and self.module, f"{self.env} - {self.module}"
+ 
+     def make_env(self) -> None:
+         """Creates a vectorized gymnasium env and stores it in `self.env`.
+
+--- rllib/env/utils/infinite_lookback_buffer.py	2025-02-21 18:03:42.291142219 +0000
++++ rllib/env/utils/infinite_lookback_buffer.py	2024-10-03 18:59:15.356135580 +0000
+@@ -459,7 +459,7 @@
+         if _ignore_last_ts:
+             data_to_use = self.data[:-1]
+         if _add_last_ts_value is not None:
+-            data_to_use = np.append(data_to_use.copy(), _add_last_ts_value)
++            data_to_use = np.concatenate([data_to_use.copy(), [_add_last_ts_value]])
+ 
+         # If index >= 0 -> Ignore lookback buffer.
+         # Otherwise, include lookback buffer.
+
+--- rllib/utils/spaces/space_utils.py	2025-02-21 18:03:42.353143573 +0000
++++ rllib/utils/spaces/space_utils.py	2024-10-06 09:39:02.478664468 +0000
+@@ -299,7 +299,7 @@
+     try:
+         ret = tree.map_structure(lambda *s: np_func(s, axis=0), *list_of_structs)
+     except Exception as e:
+-        print(e)
++        raise ValueError(e, len(list_of_structs), set(v.shape for v in list_of_structs), individual_items_already_have_batch_dim, type(tree.flatten(list_of_structs[0])), type(list_of_structs[0]))
+         return None
+     return ret
+ 
+
+--- rllib/utils/test_utils.py	2025-02-21 18:03:42.343143355 +0000
++++ rllib/utils/test_utils.py	2024-06-08 13:36:40.887576392 +0000
+@@ -1503,7 +1503,7 @@
+ 
+     # Force Tuner to use old progress output as the new one silently ignores our custom
+     # `CLIReporter`.
+-    os.environ["RAY_AIR_NEW_OUTPUT"] = "0"
++    # os.environ["RAY_AIR_NEW_OUTPUT"] = "0"
+ 
+     # Run the actual experiment (using Tune).
+     start_time = time.time()
+
+--- rllib/utils/torch_utils.py	2025-02-21 18:03:42.343143355 +0000
++++ rllib/utils/torch_utils.py	2024-06-21 14:15:18.313495070 +0000
+@@ -262,6 +262,8 @@
+             # Already numpy: Wrap as torch tensor.
+             else:
+                 tensor = torch.from_numpy(item)
++        elif isinstance(item, str):
++            return item
+         # Everything else: Convert to numpy, then wrap as torch tensor.
+         else:
+             tensor = torch.from_numpy(np.asarray(item))
+
+--- tune/execution/tune_controller.py	2025-02-21 18:03:42.412144862 +0000
++++ tune/execution/tune_controller.py	2024-06-08 12:53:19.888909628 +0000
+@@ -1682,7 +1682,7 @@
+                     "metric, or set the "
+                     "TUNE_DISABLE_STRICT_METRIC_CHECKING "
+                     "environment variable to 1. Result: {}".format(
+-                        report_metric, location, result
++                        report_metric, location, result.keys()
+                     )
+                 )
+ 
+--- tune/progress_reporter.py	2025-02-21 18:03:42.402144644 +0000
++++ tune/progress_reporter.py	2024-06-09 07:35:42.678884500 +0000
+@@ -355,7 +355,7 @@
+         current_best_trial, metric = self._current_best_trial(trials)
+         if current_best_trial:
+             messages.append(
+-                _best_trial_str(current_best_trial, metric, self._parameter_columns)
++                _best_trial_str(current_best_trial, metric, list(current_best_trial.evaluated_params.keys()) + ["env_config"])
+             )
+ 
+         if has_verbosity(Verbosity.V1_EXPERIMENT):
+@@ -1055,7 +1055,7 @@
+             for k in parameter_keys
+         ]
+     columns = (
+-        ["Trial name", "status", "loc"]
++        ["Trial name", "status"]
+         + formatted_parameter_columns
+         + formatted_metric_columns
+     )
+@@ -1256,8 +1256,8 @@
+     """
+     result = trial.last_result
+     config = trial.config
+-    location = _get_trial_location(trial, result)
+-    trial_info = [str(trial), trial.status, str(location)]
++    # location = _get_trial_location(trial, result)
++    trial_info = [str(trial), trial.status]
+     trial_info += [
+         _max_len(
+             unflattened_lookup(param, config, default=None),

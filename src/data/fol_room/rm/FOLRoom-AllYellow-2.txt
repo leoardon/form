@@ -1,0 +1,4 @@
+'u0' # initial state
+('u0', 'u1', '∀X0, yellow_checkpoint(X0)') # 
+('u1', 'u_acc', 'goal') # 
+('u_acc', 'u_acc', 'True') # 
