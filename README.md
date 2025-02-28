@@ -7,10 +7,11 @@
 
 Reward machines (RMs) are an effective approach for addressing non-Markovian rewards in reinforcement learning (RL) through finite-state machines. Traditional RMs, which label edges with propositional logic formulae, inherit the limited expressivity of propositional logic. This limitation hinders the learnability and transferability of RMs since complex tasks will require numerous states and edges. To overcome these challenges, we propose First-Order Reward Machines (FORMs), which use first-order logic to label edges, resulting in more compact and transferable RMs. We introduce a novel method for _learning_ FORMs and a multi-agent formulation for _exploiting_ them and facilitate their transferability, where multiple agents collaboratively learn policies for a shared FORM. Our experimental results demonstrate the scalability of FORMs with respect to traditional RMs. Specifically, we show that FORMs can be effectively learnt for tasks where traditional RM learning approaches fail. We also show significant improvements in learning speed and task transferability thanks to the multi-agent learning framework and the abstraction provided by the first-order language.
 
+
 <div style="display: grid; grid-template-columns: auto auto auto;">
   <div style="grid-column: 1;
   grid-row: 1 / span 2; padding: 4px">
-	<img src="imgs/env.svg" style="width:100%; max-width:100px;"/>
+	<img src="imgs/env.svg" style="width:300px"/>
   </div>
   <div style="grid-column: 2;
   grid-row: 1; display: flex; padding: 4px">
