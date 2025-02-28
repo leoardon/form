@@ -10,15 +10,15 @@ Reward machines (RMs) are an effective approach for addressing non-Markovian rew
 <div style="display: grid; grid-template-columns: auto auto auto;">
   <div style="grid-column: 1;
   grid-row: 1 / span 2; padding: 4px">
-	<img src="imgs/env.svg" style="width:100%; max-width:400px;"/>
+	<img src="imgs/env.svg" style="width:100%; max-width:100px;"/>
   </div>
   <div style="grid-column: 2;
   grid-row: 1; display: flex; padding: 4px">
-	<img src="imgs/rm_prop.svg" style="width:100%; max-width:400px;"/>
+	<img src="imgs/rm_prop.svg" style="width:100%; max-width:100px;"/>
   </div>
   <div style="grid-column: 2;
   grid-row: 2; display: flex; padding: 4px">
-	<img src="imgs/form.svg" style="width:100%; max-width:400px;"/>
+	<img src="imgs/form.svg" style="width:100%; max-width:100px;"/>
   </div>
 </div>
 
